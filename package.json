@@ -7,9 +7,7 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "migrate": "node src/utils/migrate.js",
-    "seed": "node src/utils/seed.js",
-    "init:admin": "node src/utils/init-admin.js",
-    "db:clear": "node src/utils/clear-db.js"
+    "init:admin": "node src/utils/init-admin.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
