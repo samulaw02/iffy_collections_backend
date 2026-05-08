@@ -23,6 +23,7 @@ const migrate = async () => {
         password_hash VARCHAR(255) NOT NULL,
         role user_role NOT NULL DEFAULT 'sales_rep',
         is_active BOOLEAN DEFAULT true,
+        avatar_url TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
