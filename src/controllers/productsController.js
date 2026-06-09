@@ -1,5 +1,132 @@
 const pool = require('../utils/db');
 const { logAudit } = require('./auditController');
+const { createJob, getJob, updateJob } = require('../utils/jobStore');
+
+const IMPORT_BATCH_SIZE = 25; // rows per DB transaction — keeps connections short-lived
+
+// ─── Single-batch runner ─────────────────────────────────────────────────────
+// Processes one slice of products inside a single transaction.
+// rowOffset is the absolute index of batch[0] in the full product array.
+async function runBatch(batch, rowOffset, userId, categoryMap) {
+  const client = await pool.connect();
+  const created = [];
+  const failed  = [];
+
+  try {
+    // Disable Supabase's default statement timeout for this session so long-running
+    // inserts (especially on cold-start) are never cancelled mid-batch
+    await client.query('SET statement_timeout = 0');
+    await client.query('BEGIN');
+
+    for (let i = 0; i < batch.length; i++) {
+      const row    = batch[i];
+      const rowNum = rowOffset + i + 1;
+
+      // Validate before touching the DB
+      const name        = (row.name || '').trim();
+      const retailPrice = parseFloat(String(row.retail_price || '').replace(/,/g, ''));
+      if (!name) { failed.push({ row: rowNum, name: row.name, error: 'Name is required' }); continue; }
+      if (isNaN(retailPrice) || retailPrice < 0) { failed.push({ row: rowNum, name, error: 'Valid retail price is required' }); continue; }
+
+      // Savepoint isolates this row — a DB error won't abort the whole transaction
+      await client.query(`SAVEPOINT row_${i}`);
+      try {
+        // Resolve or auto-create category
+        let categoryId = null;
+        const catName = (row.category || '').trim();
+        if (catName) {
+          const key = catName.toLowerCase();
+          if (categoryMap[key]) {
+            categoryId = categoryMap[key];
+          } else {
+            const newCat = await client.query(
+              `INSERT INTO categories (name) VALUES ($1)
+               ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name
+               RETURNING id`,
+              [catName]
+            );
+            categoryId = newCat.rows[0].id;
+            categoryMap[key] = categoryId; // share across batches
+          }
+        }
+
+        const sku = (row.sku || '').trim() || null;
+        const qty = parseInt(row.quantity) || 0;
+        const lst = parseInt(row.low_stock_threshold);
+
+        const result = await client.query(`
+          INSERT INTO products
+            (name, sku, category_id, description, price, wholesale_price, cost_price,
+             quantity, low_stock_threshold, size, color, gender, created_by)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+          RETURNING id, name
+        `, [
+          name,
+          sku,
+          categoryId,
+          (row.description || '').trim() || null,
+          retailPrice,
+          parseFloat(String(row.wholesale_price || '').replace(/,/g, '')) || 0,
+          parseFloat(String(row.cost_price    || '').replace(/,/g, '')) || 0,
+          qty,
+          isNaN(lst) ? 5 : lst,
+          (row.size   || '').trim() || null,
+          (row.color  || '').trim() || null,
+          (row.gender || '').trim() || null,
+          userId,
+        ]);
+
+        if (qty > 0) {
+          await client.query(`
+            INSERT INTO stock_adjustments
+              (product_id, adjusted_by, previous_qty, new_qty, adjustment, reason, type)
+            VALUES ($1,$2,0,$3,$3,'Bulk import','initial')
+          `, [result.rows[0].id, userId, qty]);
+        }
+
+        await client.query(`RELEASE SAVEPOINT row_${i}`);
+        created.push({ row: rowNum, name, id: result.rows[0].id });
+      } catch (rowErr) {
+        await client.query(`ROLLBACK TO SAVEPOINT row_${i}`);
+        const msg = rowErr.code === '23505' ? 'SKU already exists' : rowErr.message;
+        failed.push({ row: rowNum, name, error: msg });
+      }
+    }
+
+    await client.query('COMMIT');
+    return { created, failed };
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw err;
+  } finally {
+    client.release(); // connection returned to pool after every batch
+  }
+}
+
+// ─── Full import runner ──────────────────────────────────────────────────────
+// Splits products into batches of IMPORT_BATCH_SIZE.
+// onProgress(createdSoFar, failedSoFar) is called after each batch (optional).
+async function runImport(products, userId, onProgress) {
+  // Pre-load categories once — shared (by reference) across all batches
+  const catRows = await pool.query('SELECT id, name FROM categories');
+  const categoryMap = {};
+  catRows.rows.forEach(c => { categoryMap[c.name.toLowerCase()] = c.id; });
+
+  const allCreated = [];
+  const allFailed  = [];
+
+  for (let offset = 0; offset < products.length; offset += IMPORT_BATCH_SIZE) {
+    const batch = products.slice(offset, offset + IMPORT_BATCH_SIZE);
+    const { created, failed } = await runBatch(batch, offset, userId, categoryMap);
+    allCreated.push(...created);
+    allFailed.push(...failed);
+    onProgress?.(allCreated.length, allFailed.length);
+  }
+
+  return { created: allCreated, failed: allFailed };
+}
+
+// ─── CRUD ────────────────────────────────────────────────────────────────────
 
 const getProducts = async (req, res) => {
   try {
@@ -40,7 +167,7 @@ const getProducts = async (req, res) => {
       products: result.rows,
       total: parseInt(countResult.rows[0].count),
       page: parseInt(page),
-      totalPages: Math.ceil(parseInt(countResult.rows[0].count) / parseInt(limit))
+      totalPages: Math.ceil(parseInt(countResult.rows[0].count) / parseInt(limit)),
     });
   } catch (err) {
     console.error(err);
@@ -73,7 +200,6 @@ const createProduct = async (req, res) => {
       RETURNING *
     `, [name, sku || null, category_id || null, description, price, wholesale_price || 0, cost_price || 0, quantity || 0, low_stock_threshold || 5, size, color, gender, image_url, req.user.id]);
 
-    // Log initial stock
     if (quantity > 0) {
       await pool.query(`
         INSERT INTO stock_adjustments (product_id, adjusted_by, previous_qty, new_qty, adjustment, reason, type)
@@ -122,6 +248,9 @@ const deleteProduct = async (req, res) => {
   }
 };
 
+// ─── Bulk import ─────────────────────────────────────────────────────────────
+const SYNC_THRESHOLD = 50; // ≤ this → synchronous response; > this → background job
+
 const bulkImportProducts = async (req, res) => {
   const { products } = req.body;
   if (!Array.isArray(products) || products.length === 0)
@@ -129,95 +258,69 @@ const bulkImportProducts = async (req, res) => {
   if (products.length > 500)
     return res.status(400).json({ error: 'Maximum 500 products per import' });
 
-  const client = await pool.connect();
-  const created = [];
-  const failed = [];
-
-  try {
-    // Pre-load all categories so we can resolve names without per-row queries
-    const catRows = await client.query('SELECT id, name FROM categories');
-    const categoryMap = {};
-    catRows.rows.forEach(c => { categoryMap[c.name.toLowerCase()] = c.id; });
-
-    await client.query('BEGIN');
-
-    for (let i = 0; i < products.length; i++) {
-      const row = products[i];
-      const rowNum = i + 1;
-
-      try {
-        const name = (row.name || '').trim();
-        const retailPrice = parseFloat(row.retail_price);
-        if (!name) { failed.push({ row: rowNum, name: row.name, error: 'Name is required' }); continue; }
-        if (isNaN(retailPrice) || retailPrice < 0) { failed.push({ row: rowNum, name, error: 'Valid retail price is required' }); continue; }
-
-        // Resolve or create category
-        let categoryId = null;
-        const catName = (row.category || '').trim();
-        if (catName) {
-          const key = catName.toLowerCase();
-          if (categoryMap[key]) {
-            categoryId = categoryMap[key];
-          } else {
-            const newCat = await client.query(
-              `INSERT INTO categories (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name RETURNING id`,
-              [catName]
-            );
-            categoryId = newCat.rows[0].id;
-            categoryMap[key] = categoryId;
-          }
-        }
-
-        const sku = (row.sku || '').trim() || null;
-        const qty = parseInt(row.quantity) || 0;
-
-        const result = await client.query(`
-          INSERT INTO products
-            (name, sku, category_id, description, price, wholesale_price, cost_price,
-             quantity, low_stock_threshold, size, color, gender, created_by)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-          RETURNING id, name
-        `, [
-          name,
-          sku,
-          categoryId,
-          (row.description || '').trim() || null,
-          retailPrice,
-          parseFloat(row.wholesale_price) || 0,
-          parseFloat(row.cost_price) || 0,
-          qty,
-          parseInt(row.low_stock_threshold) || 5,
-          (row.size || '').trim() || null,
-          (row.color || '').trim() || null,
-          (row.gender || '').trim() || null,
-          req.user.id,
-        ]);
-
-        if (qty > 0) {
-          await client.query(`
-            INSERT INTO stock_adjustments (product_id, adjusted_by, previous_qty, new_qty, adjustment, reason, type)
-            VALUES ($1,$2,0,$3,$3,'Bulk import','initial')
-          `, [result.rows[0].id, req.user.id, qty]);
-        }
-
-        created.push({ row: rowNum, name, id: result.rows[0].id });
-      } catch (rowErr) {
-        const msg = rowErr.code === '23505' ? 'SKU already exists' : rowErr.message;
-        failed.push({ row: rowNum, name: (row.name || '').trim(), error: msg });
-      }
+  // ── Synchronous path (small batch) ────────────────────────────────────────
+  if (products.length <= SYNC_THRESHOLD) {
+    try {
+      const { created, failed } = await runImport(products, req.user.id);
+      logAudit(req.user.id, req.user.name, 'PRODUCT_BULK_IMPORT', 'bulk_import', null,
+        { count: created.length }, req.ip);
+      return res.json({ async: false, created: created.length, failed, total: products.length });
+    } catch (err) {
+      console.error('Bulk import error:', err);
+      return res.status(500).json({ error: 'Bulk import failed' });
     }
-
-    await client.query('COMMIT');
-    logAudit(req.user.id, req.user.name, 'PRODUCT_CREATED', 'bulk_import', null,
-      { count: created.length }, req.ip);
-    res.json({ created: created.length, failed, total: products.length });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).json({ error: 'Bulk import failed' });
-  } finally {
-    client.release();
   }
+
+  // ── Asynchronous path (large batch) ───────────────────────────────────────
+  const jobId = createJob(products.length);
+
+  // Respond immediately so the client never times out
+  res.status(202).json({
+    async: true,
+    jobId,
+    total: products.length,
+    message: `Import started. Poll /api/products/bulk-import/status/${jobId} for progress.`,
+  });
+
+  // Run in background — intentionally not awaited
+  setImmediate(async () => {
+    try {
+      const { created, failed } = await runImport(products, req.user.id, (createdSoFar, failedSoFar) => {
+        // Update job progress after every batch so the frontend progress bar moves
+        updateJob(jobId, { created: createdSoFar, failed: getJob(jobId)?.failed ?? [] });
+      });
+      updateJob(jobId, {
+        status: 'completed',
+        created: created.length,
+        failed,
+        completedAt: new Date().toISOString(),
+      });
+      logAudit(req.user.id, req.user.name, 'PRODUCT_BULK_IMPORT', 'bulk_import', null,
+        { count: created.length, async: true }, req.ip);
+    } catch (err) {
+      console.error(`Async bulk import job ${jobId} failed:`, err.message);
+      updateJob(jobId, {
+        status: 'failed',
+        completedAt: new Date().toISOString(),
+        error: err.message,
+      });
+    }
+  });
 };
 
-module.exports = { getProducts, getProduct, createProduct, updateProduct, deleteProduct, bulkImportProducts };
+// ── Job status endpoint ────────────────────────────────────────────────────
+const getBulkImportStatus = (req, res) => {
+  const job = getJob(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found or expired' });
+  res.json(job);
+};
+
+module.exports = {
+  getProducts,
+  getProduct,
+  createProduct,
+  updateProduct,
+  deleteProduct,
+  bulkImportProducts,
+  getBulkImportStatus,
+};
