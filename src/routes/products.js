@@ -1,6 +1,6 @@
 const multer = require('multer');
 const router = require('express').Router();
-const { getProducts, getProduct, createProduct, updateProduct, deleteProduct, bulkImportProducts } = require('../controllers/productsController');
+const { getProducts, getProduct, createProduct, updateProduct, deleteProduct, bulkImportProducts, getBulkImportStatus } = require('../controllers/productsController');
 const { authenticate, adminOnly } = require('../middleware/auth');
 const { uploadFile } = require('../utils/supabaseStorage');
 const pool = require('../utils/db');
@@ -15,6 +15,8 @@ const upload = multer({
 });
 
 router.get('/', authenticate, getProducts);
+// Status route must be defined before /:id so Express doesn't treat "bulk-import" as an id
+router.get('/bulk-import/status/:jobId', authenticate, adminOnly, getBulkImportStatus);
 router.get('/:id', authenticate, getProduct);
 router.post('/', authenticate, adminOnly, createProduct);
 router.post('/bulk-import', authenticate, adminOnly, bulkImportProducts);

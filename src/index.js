@@ -3,6 +3,16 @@ const express = require('express');
 const cors = require('cors');
 const app = express();
 
+// ── Safety net ───────────────────────────────────────────────────────────────
+// Background jobs (e.g. bulk import) can encounter DB timeouts.
+// Log them but never let them crash the server process.
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (server kept alive):', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection (server kept alive):', reason?.message ?? reason);
+});
+
 // Middleware
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:5173',
